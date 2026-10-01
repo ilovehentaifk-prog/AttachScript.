@@ -1,0 +1,129 @@
+-- ServerScriptService/AttachServer
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local remote = ReplicatedStorage:FindFirstChild("AttachRemote")
+if not remote then
+	remote = Instance.new("RemoteEvent")
+	remote.Name = "AttachRemote"
+	remote.Parent = ReplicatedStorage
+end
+
+local attachedTo = {}
+local lastRequest = {}
+local MAX_DISTANCE = 15
+local COOLDOWN = 1
+
+local function getRoot(character)
+	if not character then return nil end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function detach(player)
+	local weld = attachedTo[player]
+	if weld and weld.Parent then
+		weld:Destroy()
+	end
+	attachedTo[player] = nil
+end
+
+local function attach(player, target)
+	if typeof(target) ~= "Instance" or not target:IsA("Player") then return end
+	if target == player then return end
+	if target.Parent ~= Players or player.Parent ~= Players then return end
+	
+	-- Rate limit
+	local now = tick()
+	if lastRequest[player] and now - lastRequest[player] < COOLDOWN then return end
+	lastRequest[player] = now
+
+	local character = player.Character
+	local targetCharacter = target.Character
+	local root = getRoot(character)
+	local targetRoot = getRoot(targetCharacter)
+	
+	if not root or not targetRoot then return end
+	
+	-- Distance check
+	if (root.Position - targetRoot.Position).Magnitude > MAX_DISTANCE then
+		return
+	end
+	
+	-- Don't attach if target is already attached to someone / dead
+	local targetHum = targetCharacter:FindFirstChildOfClass("Humanoid")
+	if not targetHum or targetHum.Health <= 0 then return end
+
+	detach(player)
+
+	-- Use PivotTo, not CFrame = on server
+	character:PivotTo(targetRoot.CFrame * CFrame.new(0, 0, 3))
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Name = "AttachWeld"
+	weld.Part0 = root
+	weld.Part1 = targetRoot
+	weld.Parent = root
+
+	attachedTo[player] = weld
+	remote:FireClient(player, "Attached", target.DisplayName)
+	
+	-- Also tell target if you want
+	-- remote:FireClient(target, "Carrying", player.DisplayName)
+end
+
+remote.OnServerEvent:Connect(function(player, action, target)
+	if action == "Attach" then
+		attach(player, target)
+	elseif action == "Detach" then
+		detach(player)
+		remote:FireClient(player, "Detached")
+	end
+end)
+
+local function onCharRemoving(player)
+	detach(player)
+	-- Detach anyone attached TO this player
+	for owner, weld in pairs(attachedTo) do
+		if weld and weld.Part1 then
+			-- weld.Part1 is the target's root, check if it belongs to the leaving player
+			if weld.Part1.Parent and weld.Part1.Parent.Name == player.Name then
+				-- Better check: get player from character
+				local ownerChar = Players:GetPlayerFromCharacter(weld.Part1.Parent)
+				if ownerChar == player then
+					detach(owner)
+					remote:FireClient(owner, "Detached")
+				end
+			end
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterRemoving:Connect(function()
+		onCharRemoving(player)
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	detach(player)
+	lastRequest[player] = nil
+	-- clean anyone attached to leaving player
+	for owner, weld in pairs(attachedTo) do
+		if weld and weld.Parent then
+			local attachedPlayer = Players:GetPlayerFromCharacter(weld.Part1.Parent)
+			if attachedPlayer == player then
+				detach(owner)
+				remote:FireClient(owner, "Detached")
+			end
+		end
+	end
+end)
+
+-- Also detach on death
+Players:GetPlayers()
+for _, p in pairs(Players:GetPlayers()) do
+	p.CharacterRemoving:Connect(function()
+		onCharRemoving(p)
+	end)
+end
